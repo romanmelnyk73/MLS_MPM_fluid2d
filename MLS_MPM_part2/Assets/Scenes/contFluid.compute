@@ -1,0 +1,250 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#define CLEAR_GRID_THREAD_COUNT 8
+#define PARTICLE_THREAD_COUNT 8
+
+// Per Grid Cell		0
+#pragma kernel ClearGrid
+
+// Per Particle		1
+#pragma kernel Particle2Grid
+
+// Per Particle		2
+#pragma kernel P2Gdensity
+
+// Per Grid Cell		3
+#pragma kernel UpdateGrid
+
+// Per Particle		4
+#pragma kernel Grid2Particle
+
+// Per Particle		5
+//#pragma kernel Advection
+
+
+struct Particle
+{
+	float2 x; // position
+	float2 v; // velocity
+	float2x2 C; // affine momentum matrix
+    float mass;
+};
+
+struct Cell
+{
+	float2 v; // velocity
+	float mass;
+};
+
+shared RWStructuredBuffer<Particle> particle_buffer;
+shared RWStructuredBuffer<Cell> grid_buffer;
+
+int num_particles;
+float deltaTime;
+int grid_res;
+float eos_stiffness;
+float rest_density;
+float dynamic_viscosity;
+float eos_power;
+float gravity;
+
+[numthreads(CLEAR_GRID_THREAD_COUNT, 1, 1)]
+void ClearGrid(uint3 id : SV_DispatchThreadID)
+{
+	Cell cell = grid_buffer[id.x];
+	// reset grid 
+	cell.mass = 0;
+	cell.v = 0;
+
+	grid_buffer[id.x] = cell;
+}
+
+[numthreads(PARTICLE_THREAD_COUNT, 1, 1)]
+void Particle2Grid(uint3 id : SV_DispatchThreadID)
+{
+    Particle p = particle_buffer[id.x];
+
+    float3x2 weights = 0;
+
+    uint2 cell_idx = (uint2)p.x;
+    float2 cell_diff = (p.x - cell_idx) - 0.5f;
+    weights[0] = 0.5f * pow(0.5f - cell_diff, 2);
+    weights[1] = 0.75f - pow(cell_diff, 2);
+    weights[2] = 0.5f * pow(0.5f + cell_diff, 2);
+
+    float2x2 C = p.C;
+
+    for (uint gx = 0; gx < 3; ++gx) {
+        for (uint gy = 0; gy < 3; ++gy) {
+            float weight = weights[gx].x * weights[gy].y;
+
+            uint2 cell_x = uint2(cell_idx.x + gx - 1, cell_idx.y + gy - 1);
+            float2 cell_dist = (cell_x - p.x) + 0.5f;
+            float2 Q = mul(C, cell_dist);
+
+            float mass_contrib = weight * p.mass;
+
+            int cell_index = (int)cell_x.x * grid_res + (int)cell_x.y;
+            Cell cell = grid_buffer[cell_index];
+
+            // mass and momentum update
+            cell.mass += mass_contrib;
+            cell.v += mass_contrib * (p.v + Q);
+
+            grid_buffer[cell_index] = cell;
+        }
+    }
+}
+
+[numthreads(PARTICLE_THREAD_COUNT, 1, 1)]
+void P2Gdensity(uint3 id : SV_DispatchThreadID)
+{
+    float3x2 weights = 0;
+
+    Particle p = particle_buffer[id.x];
+
+    uint2 cell_idx = (uint2)p.x;
+    float2 cell_diff = (p.x - cell_idx) - 0.5f;
+    weights[0] = 0.5f * pow(0.5f - cell_diff, 2);
+    weights[1] = 0.75f - pow(cell_diff, 2);
+    weights[2] = 0.5f * pow(0.5f + cell_diff, 2);
+
+    // estimating particle volume by summing up neighbourhood's weighted mass contribution
+    float density = 0.0f;
+    uint gx, gy;
+    for (gx = 0; gx < 3; ++gx) {
+        for (gy = 0; gy < 3; ++gy) {
+            float weight = weights[gx].x * weights[gy].y;
+            int cell_index = (int)(cell_idx.x + gx - 1) * grid_res + (int)(cell_idx.y + gy - 1);
+            density += grid_buffer[cell_index].mass * weight;
+        }
+    }
+
+    float volume = p.mass / density;
+
+    // end goal, constitutive equation for isotropic fluid: 
+    // stress = -pressure * I + viscosity * (velocity_gradient + velocity_gradient_transposed)
+    // Tait equation of state. 
+    // clamping helps prevent particles absorbing into each other with negative pressures
+    float pressure = max(-0.1f, eos_stiffness * (pow(abs(density / rest_density), eos_power) - 1));
+
+    float2x2 stress = {
+        -pressure, 0,
+            0, -pressure
+    };
+
+    float2x2 dudv = p.C;
+    float2x2 strain = dudv;
+
+    float trace = strain[0][1] + strain[1][0];
+    strain[0][1] = strain[1][0] = trace;
+
+    float2x2 viscosity_term = dynamic_viscosity * strain;
+    stress += viscosity_term;
+
+    float2x2 eq_16_term_0 = -volume * 4 * stress * deltaTime;
+
+    for (gx = 0; gx < 3; ++gx) {
+        for (gy = 0; gy < 3; ++gy) {
+            float weight = weights[gx].x * weights[gy].y;
+
+            uint2 cell_x = uint2(cell_idx.x + gx - 1, cell_idx.y + gy - 1);
+            float2 cell_dist = (cell_x - p.x) + 0.5f;
+
+            int cell_index = (int)cell_x.x * grid_res + (int)cell_x.y;
+            Cell cell = grid_buffer[cell_index];
+
+            // fused force + momentum contribution from MLS-MPM
+            float2 momentum = mul(eq_16_term_0 * weight, cell_dist);
+            cell.v += momentum;
+
+            grid_buffer[cell_index] = cell;
+            
+        }
+    }
+}
+
+[numthreads(CLEAR_GRID_THREAD_COUNT, 1, 1)]
+void UpdateGrid(uint3 id : SV_DispatchThreadID)
+{
+    Cell cell = grid_buffer[id.x];
+
+    if (cell.mass > 0) {
+        // convert momentum to velocity, apply gravity
+        cell.v /= cell.mass;
+        cell.v += deltaTime * float2(0, gravity);
+
+        // boundary conditions
+        int x = id.x / grid_res;
+        int y = id.x % grid_res;
+        if (x < 2 || x > grid_res - 3) { cell.v.x = 0; }
+        if (y < 2 || y > grid_res - 3) { cell.v.y = 0; }
+
+        grid_buffer[id.x] = cell;
+    }
+}
+
+[numthreads(PARTICLE_THREAD_COUNT, 1, 1)]
+void Grid2Particle(uint3 id : SV_DispatchThreadID)
+{
+    Particle p = particle_buffer[id.x];
+
+    // reset particle velocity
+    p.v = 0;
+
+    float3x2 weights = 0;
+
+    uint2 cell_idx = (uint2)p.x;
+    float2 cell_diff = (p.x - cell_idx) - 0.5f;
+    weights[0] = 0.5f * pow(0.5f - cell_diff, 2);
+    weights[1] = 0.75f - pow(cell_diff, 2);
+    weights[2] = 0.5f * pow(0.5f + cell_diff, 2);
+    
+    float2x2 B = 0;
+    for (uint gx = 0; gx < 3; ++gx) {
+        for (uint gy = 0; gy < 3; ++gy) {
+            float weight = weights[gx].x * weights[gy].y;
+
+            uint2 cell_x = uint2(cell_idx.x + gx - 1, cell_idx.y + gy - 1);
+            int cell_index = (int)cell_x.x * grid_res + (int)cell_x.y;
+
+            float2 dist = (cell_x - p.x) + 0.5f;
+            float2 weighted_velocity = grid_buffer[cell_index].v * weight;
+
+            float2x2 term = {weighted_velocity * dist.x, weighted_velocity * dist.y};
+            
+            B += term;
+
+            p.v += weighted_velocity;
+        }
+    }
+
+    p.C = B * 4;
+
+    // advect particles
+    p.x += p.v * deltaTime;
+
+    // safety clamp to ensure particles don't exit simulation domain
+    p.x = clamp(p.x, 1, grid_res - 2);
+
+    // boundaries
+    float2 x_n = p.x + p.v;
+    float wall_min = 3;
+    float wall_max = grid_res - 4;
+    if (x_n.x < wall_min) p.v.x += wall_min - x_n.x;
+    if (x_n.x > wall_max) p.v.x += wall_max - x_n.x;
+    if (x_n.y < wall_min) p.v.y += wall_min - x_n.y;
+    if (x_n.y > wall_max) p.v.y += wall_max - x_n.y;
+
+    particle_buffer[id.x] = p;
+}
+
+[numthreads(PARTICLE_THREAD_COUNT, 1, 1)]
+void Advection(uint3 id : SV_DispatchThreadID)
+{
+	Particle p = particle_buffer[id.x];
+
+	p.x += p.v * deltaTime;
+
+	particle_buffer[id.x] = p;
+}
+
