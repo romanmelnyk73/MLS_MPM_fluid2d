@@ -15,14 +15,15 @@ public class MLS_MPM_part2 : MonoBehaviour
         public float mass;
     }
 
-    struct Cell
-    {
-        public float2 v; // velocity
-        public float mass;
-    }
+    //struct Cell
+    //{
+    //    public float2 v; // velocity
+    //    public float mass;
+    //}
 
     // simulation parameters
     const int iterations = 10;
+    int coef = 10000;
 
     const int grid_res = 256;
     const int num_cells = grid_res * grid_res;
@@ -52,7 +53,7 @@ public class MLS_MPM_part2 : MonoBehaviour
     [SerializeField] Material instance_material;
 
     Particle[] ps;
-    Cell[] grid;
+    //Cell[] grid;
    
     Bounds bounds;
 
@@ -116,14 +117,14 @@ public class MLS_MPM_part2 : MonoBehaviour
 
         }
 
-        grid = new Cell[num_cells];
+        //grid = new Cell[num_cells];
 
-        for (int i = 0; i < num_cells; ++i)
-        {
-            var cell = new Cell();
-            cell.v = 0;
-            grid[i] = cell;
-        }
+        //for (int i = 0; i < num_cells; ++i)
+        //{
+        //    var cell = new Cell();
+        //    cell.v = 0;
+        //    grid[i] = cell;
+        //}
     }
     private void InitShaders() 
     {
@@ -137,8 +138,8 @@ public class MLS_MPM_part2 : MonoBehaviour
         point_buffer.SetData(ps);
         instance_material.SetBuffer("particle_buffer", point_buffer);
 
-        grid_buffer = new ComputeBuffer(num_cells, 3 * sizeof(float), ComputeBufferType.Default);
-        grid_buffer.SetData(grid);
+        grid_buffer = new ComputeBuffer(num_cells, 3 * sizeof(int), ComputeBufferType.Default);
+        //grid_buffer.SetData(grid);
 
 
         // indirect arguments for mesh instances
@@ -164,6 +165,7 @@ public class MLS_MPM_part2 : MonoBehaviour
 
         shader.SetInt("grid_res", grid_res);
         shader.SetInt("num_particles", num_particles);
+        shader.SetInt("coef", coef);
 
         shader.SetFloat("rest_density", rest_density);
         shader.SetFloat("dynamic_viscosity", dynamic_viscosity);

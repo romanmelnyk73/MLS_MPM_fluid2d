@@ -2,6 +2,10 @@
 #define CLEAR_GRID_THREAD_COUNT 8
 #define PARTICLE_THREAD_COUNT 8
 
+#define FLOAT_TO_INT_DIGIT 10000
+#define INT_TO_FLOAT_DIGIT (1.0 / (float)FLOAT_TO_INT_DIGIT)
+
+
 // Per Grid Cell		0
 #pragma kernel ClearGrid
 
@@ -31,12 +35,13 @@ struct Particle
 
 struct Cell
 {
-	float2 v; // velocity
-	float mass;
+	int2 v; // velocity
+    int mass;
 };
 
 shared RWStructuredBuffer<Particle> particle_buffer;
 shared RWStructuredBuffer<Cell> grid_buffer;
+
 
 int num_particles;
 float deltaTime;
@@ -84,13 +89,18 @@ void Particle2Grid(uint3 id : SV_DispatchThreadID)
             float mass_contrib = weight * p.mass;
 
             int cell_index = (int)cell_x.x * grid_res + (int)cell_x.y;
-            Cell cell = grid_buffer[cell_index];
+            //Cell cell = grid_buffer[cell_index];
 
             // mass and momentum update
-            cell.mass += mass_contrib;
-            cell.v += mass_contrib * (p.v + Q);
+            int cell_mass = (int) (mass_contrib * FLOAT_TO_INT_DIGIT);
+            int2 cell_v = (int2) (mass_contrib * (p.v + Q) * FLOAT_TO_INT_DIGIT);
 
-            grid_buffer[cell_index] = cell;
+            
+            InterlockedAdd(grid_buffer[cell_index].mass, cell_mass);
+            InterlockedAdd(grid_buffer[cell_index].v.x, cell_v.x);
+            InterlockedAdd(grid_buffer[cell_index].v.y, cell_v.y);
+
+            //grid_buffer[cell_index] = cell;
         }
     }
 }
@@ -115,7 +125,7 @@ void P2Gdensity(uint3 id : SV_DispatchThreadID)
         for (gy = 0; gy < 3; ++gy) {
             float weight = weights[gx].x * weights[gy].y;
             int cell_index = (int)(cell_idx.x + gx - 1) * grid_res + (int)(cell_idx.y + gy - 1);
-            density += grid_buffer[cell_index].mass * weight;
+            density += (float)grid_buffer[cell_index].mass * (float)INT_TO_FLOAT_DIGIT * weight;
         }
     }
 
@@ -155,9 +165,12 @@ void P2Gdensity(uint3 id : SV_DispatchThreadID)
 
             // fused force + momentum contribution from MLS-MPM
             float2 momentum = mul(eq_16_term_0 * weight, cell_dist);
-            cell.v += momentum;
+            cell.v += (int2)(momentum * FLOAT_TO_INT_DIGIT);
 
             grid_buffer[cell_index] = cell;
+            /*InterlockedAdd(grid_buffer[cell_index].mass, cell.mass);
+            InterlockedAdd(grid_buffer[cell_index].v.x, cell.v.x);
+            InterlockedAdd(grid_buffer[cell_index].v.y, cell.v.y);*/
             
         }
     }
@@ -170,8 +183,14 @@ void UpdateGrid(uint3 id : SV_DispatchThreadID)
 
     if (cell.mass > 0) {
         // convert momentum to velocity, apply gravity
-        cell.v /= cell.mass;
-        cell.v += deltaTime * float2(0, gravity);
+        //cell.v /= cell.mass;
+        //cell.v += deltaTime * float2(0, gravity);
+
+        float mass = ((float)cell.mass) * INT_TO_FLOAT_DIGIT;
+        float2 velocity = ((float2)cell.v) * INT_TO_FLOAT_DIGIT;
+
+        velocity /= mass;
+        velocity += deltaTime * float2(0, gravity);
 
         // boundary conditions
         int x = id.x / grid_res;
@@ -179,7 +198,10 @@ void UpdateGrid(uint3 id : SV_DispatchThreadID)
         if (x < 2 || x > grid_res - 3) { cell.v.x = 0; }
         if (y < 2 || y > grid_res - 3) { cell.v.y = 0; }
 
+        cell.v = (int2)(velocity * FLOAT_TO_INT_DIGIT);
+
         grid_buffer[id.x] = cell;
+        
     }
 }
 
@@ -208,7 +230,7 @@ void Grid2Particle(uint3 id : SV_DispatchThreadID)
             int cell_index = (int)cell_x.x * grid_res + (int)cell_x.y;
 
             float2 dist = (cell_x - p.x) + 0.5f;
-            float2 weighted_velocity = grid_buffer[cell_index].v * weight;
+            float2 weighted_velocity = float2 ((float2)grid_buffer[cell_index].v * (float)INT_TO_FLOAT_DIGIT * weight);
 
             float2x2 term = {weighted_velocity * dist.x, weighted_velocity * dist.y};
             
